@@ -87,4 +87,12 @@ impl Cursor for PseudoCursor {
         let _ = key;
         todo!()
     }
+
+    fn last(&mut self) -> Result<CursorResult<()>> {
+        todo!()
+    }
+
+    fn prev(&mut self) -> Result<CursorResult<()>> {
+        todo!()
+    }
 }
