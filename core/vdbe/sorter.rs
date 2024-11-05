@@ -3,6 +3,7 @@ use crate::{
     Result,
 };
 use std::cell::{Ref, RefCell};
+use std::cmp::Ordering;
 
 pub struct Sorter {
     records: Vec<OwnedRecord>,
@@ -27,10 +28,28 @@ impl Cursor for Sorter {
 
     // We do the sorting here since this is what is called by the SorterSort instruction
     fn rewind(&mut self) -> Result<CursorResult<()>> {
-        let key_fields = self.order.len();
-        self.records
-            .sort_by_cached_key(|record| OwnedRecord::new(record.values[0..key_fields].to_vec()));
-        self.records.reverse();
+        println!("order:{:?}", self.order);
+
+        self.records.sort_by(|a, b| {
+            let cmp_by_idx = |idx: usize, ascending: bool| {
+                let a = &a.values[idx];
+                let b = &b.values[idx];
+                if ascending {
+                    b.cmp(a)
+                } else {
+                    a.cmp(b)
+                }
+            };
+
+            let mut cmp_ret = Ordering::Equal;
+            for (idx, &is_asc) in self.order.iter().enumerate() {
+                cmp_ret = cmp_by_idx(idx, is_asc);
+                if cmp_ret != Ordering::Equal {
+                    break;
+                }
+            }
+            cmp_ret
+        });
 
         self.next()
     }
@@ -85,6 +104,14 @@ impl Cursor for Sorter {
 
     fn exists(&mut self, key: &OwnedValue) -> Result<CursorResult<bool>> {
         let _ = key;
+        todo!()
+    }
+
+    fn last(&mut self) -> Result<CursorResult<()>> {
+        todo!()
+    }
+
+    fn prev(&mut self) -> Result<CursorResult<()>> {
         todo!()
     }
 }

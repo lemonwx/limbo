@@ -8,7 +8,8 @@ use crate::storage::sqlite3_ondisk::{
 use crate::types::{Cursor, CursorResult, OwnedRecord, OwnedValue, SeekKey, SeekOp};
 use crate::Result;
 
-use std::cell::{Ref, RefCell};
+use std::cell::{self, Ref, RefCell};
+use std::cmp::Reverse;
 use std::rc::Rc;
 
 use super::sqlite3_ondisk::{write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell};
@@ -27,7 +28,7 @@ const BTREE_HEADER_OFFSET_RIGHTMOST: usize = 8; /* if internalnode, pointer righ
 pub struct MemPage {
     parent: Option<Rc<MemPage>>,
     page_idx: usize,
-    cell_idx: RefCell<usize>,
+    cell_idx: RefCell<i32>,
 }
 
 impl MemPage {
@@ -35,17 +36,28 @@ impl MemPage {
         Self {
             parent,
             page_idx,
-            cell_idx: RefCell::new(cell_idx),
+            cell_idx: RefCell::new(cell_idx as i32),
         }
     }
 
     pub fn cell_idx(&self) -> usize {
-        *self.cell_idx.borrow()
+        *self.cell_idx.borrow() as usize
     }
 
     pub fn advance(&self) {
         let mut cell_idx = self.cell_idx.borrow_mut();
         *cell_idx += 1;
+    }
+
+    pub fn valid(&self) -> bool {
+        let cell_idx = self.cell_idx.borrow_mut();
+        *cell_idx >= 0
+    }
+
+    pub fn retreat(&self) {
+        let mut cell_idx = self.cell_idx.borrow_mut();
+        // println!("cell idx:{:?}", cell_idx);
+        *cell_idx -= 1;
     }
 }
 
@@ -90,6 +102,174 @@ impl BTreeCursor {
         Ok(CursorResult::Ok(page.cell_count() == 0))
     }
 
+    fn page_type(&self, page_idx: usize) -> Result<PageType> {
+        let p = self.pager.read_page(page_idx)?;
+        let c = RefCell::borrow(&p);
+        let c = c.contents.read().unwrap();
+        let c = c.as_ref().unwrap();
+        Ok(c.page_type())
+    }
+
+    fn get_record(&mut self) -> Result<CursorResult<(Option<u64>, Option<OwnedRecord>)>> {
+        loop {
+            let mem_page = self.get_mem_page();
+
+            if !mem_page.valid() {
+                return Ok(CursorResult::Ok((None, None)));
+            }
+
+            let page_idx = mem_page.page_idx;
+            let page = self.pager.read_page(page_idx)?;
+            let page = RefCell::borrow(&page);
+            if page.is_locked() {
+                return Ok(CursorResult::IO);
+            }
+            let page = page.contents.read().unwrap();
+            let page = page.as_ref().unwrap();
+
+            // if mem_page.cell_idx() == 0 {
+            // let parent = mem_page.parent.clone();
+            // match page.rightmost_pointer() {
+            //     Some(right_most_pointer) => {
+            //         let mem_page = MemPage::new(parent.clone(), right_most_pointer as usize, 0);
+            //         self.page.replace(Some(Rc::new(mem_page)));
+            //         continue;
+            //     }
+            //     None => match parent {
+            //         Some(ref parent) => {
+            //             self.going_upwards = true;
+            //             self.page.replace(Some(parent.clone()));
+            //             continue;
+            //         }
+            //         None => {
+            // return Ok(CursorResult::Ok((None, None)));
+            //         }
+            //     },
+            // }
+            // }
+
+            if mem_page.cell_idx() == page.cell_count() - 1 {
+                println!(
+                    "idx:{:?} {:?} {}",
+                    mem_page.cell_idx(),
+                    page.page_type(),
+                    mem_page.page_idx
+                );
+            }
+            let cell = page.cell_get(
+                // page.cell_count() - 1 - mem_page.cell_idx(),
+                mem_page.cell_idx(),
+                self.pager.clone(),
+                self.max_local(page.page_type()),
+                self.min_local(page.page_type()),
+                self.usable_space(),
+            )?;
+
+            if mem_page.cell_idx() == 0 {}
+
+            match &cell {
+                BTreeCell::TableInteriorCell(TableInteriorCell {
+                    _left_child_page,
+                    _rowid,
+                }) => {
+                    // mem_page.advance();
+
+                    // mem_page.advance();
+
+                    let page_idx = *_left_child_page as usize;
+
+                    let page = self.pager.read_page(page_idx)?;
+                    let page = RefCell::borrow(&page);
+                    if page.is_locked() {
+                        return Ok(CursorResult::IO);
+                    }
+                    let page = page.contents.read().unwrap();
+                    let page = page.as_ref().unwrap();
+
+                    println!(
+                        "page idx:{} {} {} {} {:?}",
+                        page_idx,
+                        _rowid,
+                        page.cell_count(),
+                        page.is_leaf(),
+                        page.rightmost_pointer()
+                    );
+
+                    let p = mem_page.clone();
+                    // p.retreat();
+                    assert!(page.is_leaf());
+                    if page.cell_count() > 0 {
+                        let mem_page = MemPage::new(
+                            Some(p),
+                            *_left_child_page as usize,
+                            page.cell_count() - 1,
+                        );
+                        self.page.replace(Some(Rc::new(mem_page)));
+                    }
+                    continue;
+                }
+                BTreeCell::TableLeafCell(TableLeafCell {
+                    _rowid,
+                    _payload,
+                    first_overflow_page: _,
+                }) => {
+                    let record: OwnedRecord =
+                        crate::storage::sqlite3_ondisk::read_record(_payload)?;
+                    if mem_page.cell_idx() == 0 {
+                        let parent = mem_page.parent.clone();
+                        let parent_page_idx = parent.unwrap().page_idx;
+
+                        println!(
+                            "p:{:?} {:?} {:?} {:?}",
+                            parent_page_idx,
+                            self.root_page,
+                            page.rightmost_pointer(),
+                            self.page_type(parent_page_idx),
+                        );
+
+                        let mem_page = mem_page.parent.clone().unwrap();
+                        mem_page.retreat();
+                        self.page.replace(Some(mem_page));
+                    } else {
+                        mem_page.retreat();
+                    }
+                    return Ok(CursorResult::Ok((Some(*_rowid), Some(record))));
+                }
+                _ => unimplemented!(), // BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                                       //     payload,
+                                       //     left_child_page,
+                                       //     ..
+                                       // }) => {
+                                       //     if !self.going_upwards {
+                                       //         let mem_page =
+                                       //             MemPage::new(Some(mem_page.clone()), *left_child_page as usize, 0);
+                                       //         self.page.replace(Some(Rc::new(mem_page)));
+                                       //         continue;
+                                       //     }
+
+                                       //     self.going_upwards = false;
+                                       //     mem_page.advance();
+
+                                       //     let record = crate::storage::sqlite3_ondisk::read_record(payload)?;
+                                       //     let rowid = match record.values.last() {
+                                       //         Some(OwnedValue::Integer(rowid)) => *rowid as u64,
+                                       //         _ => unreachable!("index cells should have an integer rowid"),
+                                       //     };
+                                       //     return Ok(CursorResult::Ok((Some(rowid), Some(record))));
+                                       // }
+                                       // BTreeCell::IndexLeafCell(IndexLeafCell { payload, .. }) => {
+                                       //     mem_page.advance();
+                                       //     let record = crate::storage::sqlite3_ondisk::read_record(payload)?;
+                                       //     let rowid = match record.values.last() {
+                                       //         Some(OwnedValue::Integer(rowid)) => *rowid as u64,
+                                       //         _ => unreachable!("index cells should have an integer rowid"),
+                                       //     };
+                                       //     return Ok(CursorResult::Ok((Some(rowid), Some(record))));
+                                       // }
+            }
+        }
+    }
+
     fn get_next_record(
         &mut self,
         predicate: Option<(SeekKey<'_>, SeekOp)>,
@@ -125,13 +305,20 @@ impl BTreeCursor {
                     },
                 }
             }
+
+            println!("idx:{:?}", mem_page.cell_idx());
+
             let cell = page.cell_get(
+                // page.cell_count() - 1 - mem_page.cell_idx(),
                 mem_page.cell_idx(),
                 self.pager.clone(),
                 self.max_local(page.page_type()),
                 self.min_local(page.page_type()),
                 self.usable_space(),
             )?;
+
+            println!("cell:{:?}", cell);
+
             match &cell {
                 BTreeCell::TableInteriorCell(TableInteriorCell {
                     _left_child_page,
@@ -347,14 +534,14 @@ impl BTreeCursor {
             let page = page.as_ref().unwrap();
             if page.is_leaf() {
                 if page.cell_count() > 0 {
-                    mem_page.cell_idx.replace(page.cell_count() - 1);
+                    mem_page.cell_idx.replace((page.cell_count() - 1) as i32);
                 }
                 return Ok(CursorResult::Ok(()));
             }
 
             match page.rightmost_pointer() {
                 Some(right_most_pointer) => {
-                    mem_page.cell_idx.replace(page.cell_count());
+                    mem_page.cell_idx.replace(page.cell_count() as i32);
                     let mem_page =
                         MemPage::new(Some(mem_page.clone()), right_most_pointer as usize, 0);
                     self.page.replace(Some(Rc::new(mem_page)));
@@ -1424,11 +1611,28 @@ impl Cursor for BTreeCursor {
         }
     }
 
+    fn last(&mut self) -> Result<CursorResult<()>> {
+        self.move_to_rightmost()?;
+        self.prev()
+    }
+
     fn next(&mut self) -> Result<CursorResult<()>> {
         match self.get_next_record(None)? {
             CursorResult::Ok((rowid, next)) => {
                 self.rowid.replace(rowid);
                 self.record.replace(next);
+                Ok(CursorResult::Ok(()))
+            }
+            CursorResult::IO => Ok(CursorResult::IO),
+        }
+    }
+
+    fn prev(&mut self) -> Result<CursorResult<()>> {
+        match self.get_record()? {
+            CursorResult::Ok((rowid, record)) => {
+                self.rowid.replace(rowid);
+                self.record.replace(record);
+                // self.get_mem_page().retreat();
                 Ok(CursorResult::Ok(()))
             }
             CursorResult::IO => Ok(CursorResult::IO),

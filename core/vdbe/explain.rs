@@ -866,6 +866,48 @@ pub fn insn_to_str(
                 0,
                 format!("r[{}]=r[{}]", dst_reg, src_reg),
             ),
+            Insn::LastAsync { cursor_id } => (
+                "LastAsync",
+                0,
+                0,
+                0,
+                OwnedValue::Text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
+            ),
+            Insn::LastAwait {
+                cursor_id,
+                pc_if_empty,
+            } => (
+                "LastAwait",
+                0,
+                0,
+                0,
+                OwnedValue::Text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
+            ),
+            Insn::PrevAsync { cursor_id } => (
+                "PrevAsync",
+                0,
+                0,
+                0,
+                OwnedValue::Text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
+            ),
+            Insn::PrevAwait {
+                cursor_id,
+                pc_if_next,
+            } => (
+                "PrevAwait",
+                0,
+                0,
+                0,
+                OwnedValue::Text(Rc::new("".to_string())),
+                0,
+                "".to_string(),
+            ),
         };
     format!(
         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",

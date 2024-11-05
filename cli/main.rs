@@ -36,7 +36,14 @@ struct Opts {
 #[allow(clippy::arc_with_non_send_sync)]
 fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let opts = Opts::parse();
+
+    let opts = Opts {
+        database: PathBuf::from("../../database.db"),
+        sql: None,
+        output_mode: OutputMode::Pretty,
+    };
+
+    // let opts = Opts::parse();
     let path = opts.database.to_str().unwrap();
     let io = Arc::new(limbo_core::PlatformIO::new()?);
     let db = Database::open_file(io.clone(), path)?;

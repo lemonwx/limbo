@@ -88,16 +88,19 @@ fn eliminate_unnecessary_orderby(
 ) -> Result<()> {
     match operator {
         Operator::Order { source, key, .. } => {
-            if key.len() != 1 || key.first().unwrap().1 != Direction::Ascending {
+            // if key.len() != 1 || key.first().unwrap().1 != Direction::Ascending {
+            if key.len() != 1 {
                 // TODO: handle multiple order by keys and descending order
                 return Ok(());
             }
-            let already_ordered = _operator_is_already_ordered_by(
-                source,
-                &mut key.first_mut().unwrap().0,
-                available_indexes,
-            )?;
+
+            let (key, direction) = key.first_mut().unwrap();
+
+            let already_ordered = _operator_is_already_ordered_by(source, key, available_indexes)?;
+
             if already_ordered {
+                push_scan_direction(source, direction);
+
                 *operator = source.take_ownership();
             }
             Ok(())
@@ -569,6 +572,70 @@ fn push_predicate(
             Ok(Some(push_result.unwrap()))
         }
         Operator::Nothing => Ok(Some(predicate)),
+    }
+}
+
+fn push_scan_direction(operator: &mut Operator, direction: &Direction) {
+    match operator {
+        Operator::Aggregate {
+            id,
+            source,
+            aggregates,
+            group_by,
+            step,
+        } => todo!(),
+        Operator::Filter {
+            id,
+            source,
+            predicates,
+        } => todo!(),
+        Operator::Limit {
+            id,
+            source,
+            limit,
+            step,
+        } => todo!(),
+        Operator::Join {
+            id,
+            left,
+            right,
+            predicates,
+            outer,
+            step,
+        } => todo!(),
+        Operator::Order {
+            id,
+            source,
+            key,
+            step,
+        } => {}
+        Operator::Projection {
+            id,
+            source,
+            expressions,
+            step,
+        } => push_scan_direction(source, direction),
+        Operator::Scan {
+            id,
+            table_reference,
+            predicates,
+            step,
+            reverse,
+        } => {
+            // table_reference.scan_direction = direction.clone();
+            match direction {
+                Direction::Ascending => *reverse = false,
+                Direction::Descending => *reverse = true,
+            }
+        }
+        Operator::Search {
+            id,
+            table_reference,
+            search,
+            predicates,
+            step,
+        } => todo!(),
+        Operator::Nothing => todo!(),
     }
 }
 

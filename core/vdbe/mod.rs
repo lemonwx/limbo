@@ -202,6 +202,15 @@ pub enum Insn {
         pc_if_empty: BranchOffset,
     },
 
+    LastAsync {
+        cursor_id: CursorID,
+    },
+
+    LastAwait {
+        cursor_id: CursorID,
+        pc_if_empty: BranchOffset,
+    },
+
     // Read a column from the current row of the cursor.
     Column {
         cursor_id: CursorID,
@@ -229,6 +238,15 @@ pub enum Insn {
 
     // Await for the completion of cursor advance.
     NextAwait {
+        cursor_id: CursorID,
+        pc_if_next: BranchOffset,
+    },
+
+    PrevAsync {
+        cursor_id: CursorID,
+    },
+
+    PrevAwait {
         cursor_id: CursorID,
         pc_if_next: BranchOffset,
     },
@@ -992,6 +1010,29 @@ impl Program {
                     }
                     state.pc += 1;
                 }
+                Insn::LastAsync { cursor_id } => {
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    match cursor.last()? {
+                        CursorResult::Ok(()) => {}
+                        CursorResult::IO => {
+                            // If there is I/O, the instruction is restarted.
+                            return Ok(StepResult::IO);
+                        }
+                    }
+                    state.pc += 1;
+                }
+                Insn::LastAwait {
+                    cursor_id,
+                    pc_if_empty,
+                } => {
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    cursor.wait_for_completion()?;
+                    if cursor.is_empty() {
+                        state.pc = *pc_if_empty;
+                    } else {
+                        state.pc += 1;
+                    }
+                }
                 Insn::RewindAwait {
                     cursor_id,
                     pc_if_empty,
@@ -1033,6 +1074,10 @@ impl Program {
                     } else {
                         state.registers[*dest] = OwnedValue::Null;
                     }
+                    if *column == 0 {
+                        let val = &state.registers[*dest];
+                        println!("val:{:?}", val);
+                    }
                     state.pc += 1;
                 }
                 Insn::MakeRecord {
@@ -1060,6 +1105,31 @@ impl Program {
                         }
                     }
                     state.pc += 1;
+                }
+                Insn::PrevAsync { cursor_id } => {
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    cursor.set_null_flag(false);
+                    match cursor.prev()? {
+                        CursorResult::Ok(_) => {}
+                        CursorResult::IO => {
+                            // If there is I/O, the instruction is restarted.
+                            return Ok(StepResult::IO);
+                        }
+                    }
+                    state.pc += 1;
+                }
+                Insn::PrevAwait {
+                    cursor_id,
+                    pc_if_next,
+                } => {
+                    assert!(*pc_if_next >= 0);
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    cursor.wait_for_completion()?;
+                    if !cursor.is_empty() {
+                        state.pc = *pc_if_next;
+                    } else {
+                        state.pc += 1;
+                    }
                 }
                 Insn::NextAwait {
                     cursor_id,
@@ -2125,6 +2195,7 @@ fn get_indent_count(indent_count: usize, curr_insn: &Insn, prev_insn: Option<&In
     let indent_count = if let Some(insn) = prev_insn {
         match insn {
             Insn::RewindAwait { .. }
+            | Insn::LastAwait { .. }
             | Insn::SorterSort { .. }
             | Insn::SeekGE { .. }
             | Insn::SeekGT { .. } => indent_count + 1,
@@ -2135,7 +2206,9 @@ fn get_indent_count(indent_count: usize, curr_insn: &Insn, prev_insn: Option<&In
     };
 
     match curr_insn {
-        Insn::NextAsync { .. } | Insn::SorterNext { .. } => indent_count - 1,
+        Insn::NextAsync { .. } | Insn::SorterNext { .. } | Insn::PrevAsync { .. } => {
+            indent_count - 1
+        }
         _ => indent_count,
     }
 }

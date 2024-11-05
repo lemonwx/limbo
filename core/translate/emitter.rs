@@ -172,7 +172,7 @@ impl Emitter for Operator {
                 id,
                 step,
                 predicates,
-                ..
+                reverse,
             } => {
                 *step += 1;
                 const SCAN_OPEN_READ: usize = 1;
@@ -196,15 +196,27 @@ impl Emitter for Operator {
                         Ok(OpStepResult::Continue)
                     }
                     SCAN_BODY => {
+                        println!("scan body:{}", reverse);
                         let cursor_id =
                             program.resolve_cursor_id(&table_reference.table_identifier, None);
-                        program.emit_insn(Insn::RewindAsync { cursor_id });
+                        if *reverse {
+                            program.emit_insn(Insn::LastAsync { cursor_id });
+                        } else {
+                            program.emit_insn(Insn::RewindAsync { cursor_id });
+                        }
                         let scan_loop_body_label = program.allocate_label();
                         let halt_label = m.termination_label_stack.last().unwrap();
                         program.emit_insn_with_label_dependency(
-                            Insn::RewindAwait {
-                                cursor_id,
-                                pc_if_empty: *halt_label,
+                            if *reverse {
+                                Insn::LastAwait {
+                                    cursor_id,
+                                    pc_if_empty: *halt_label,
+                                }
+                            } else {
+                                Insn::RewindAwait {
+                                    cursor_id,
+                                    pc_if_empty: *halt_label,
+                                }
                             },
                             *halt_label,
                         );
@@ -237,19 +249,36 @@ impl Emitter for Operator {
                         Ok(OpStepResult::ReadyToEmit)
                     }
                     SCAN_NEXT => {
+                        println!("scan body:{}", reverse);
                         let cursor_id =
                             program.resolve_cursor_id(&table_reference.table_identifier, None);
                         program
                             .resolve_label(*m.next_row_labels.get(id).unwrap(), program.offset());
-                        program.emit_insn(Insn::NextAsync { cursor_id });
+                        if *reverse {
+                            program.emit_insn(Insn::PrevAsync { cursor_id });
+                        } else {
+                            program.emit_insn(Insn::NextAsync { cursor_id });
+                        }
+                        // program.emit_insn(Insn::NextAsync { cursor_id });
                         let jump_label = m.scan_loop_body_labels.pop().unwrap();
-                        program.emit_insn_with_label_dependency(
-                            Insn::NextAwait {
-                                cursor_id,
-                                pc_if_next: jump_label,
-                            },
-                            jump_label,
-                        );
+
+                        if *reverse {
+                            program.emit_insn_with_label_dependency(
+                                Insn::PrevAwait {
+                                    cursor_id,
+                                    pc_if_next: jump_label,
+                                },
+                                jump_label,
+                            );
+                        } else {
+                            program.emit_insn_with_label_dependency(
+                                Insn::NextAwait {
+                                    cursor_id,
+                                    pc_if_next: jump_label,
+                                },
+                                jump_label,
+                            );
+                        }
                         Ok(OpStepResult::Done)
                     }
                     _ => Ok(OpStepResult::Done),

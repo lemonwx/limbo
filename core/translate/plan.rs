@@ -4,6 +4,8 @@ use std::{
     rc::Rc,
 };
 
+use pest::pratt_parser::Op;
+use rustix::fs::Dir;
 use sqlite3_parser::ast;
 
 use crate::{
@@ -114,6 +116,7 @@ pub enum Operator {
         table_reference: BTreeTableReference,
         predicates: Option<Vec<ast::Expr>>,
         step: usize,
+        reverse: bool,
     },
     // Search operator
     // This operator is used to search for a row in a table using an index
