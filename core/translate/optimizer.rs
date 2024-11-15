@@ -5,8 +5,7 @@ use sqlite3_parser::ast;
 use crate::{schema::Index, util::normalize_ident, Result};
 
 use super::plan::{
-    get_table_ref_bitmask_for_ast_expr, get_table_ref_bitmask_for_operator, BTreeTableReference,
-    Direction, Operator, Plan, ProjectionColumn, Search,
+    get_table_ref_bitmask_for_ast_expr, get_table_ref_bitmask_for_operator, BTreeTableReference, Direction, IterationDirection, Operator, Plan, ProjectionColumn, Search
 };
 
 /**
@@ -89,7 +88,7 @@ fn eliminate_unnecessary_orderby(
     match operator {
         Operator::Order { source, key, .. } => {
             if key.len() != 1 {
-                // TODO: handle multiple order by keys and descending order
+                // TODO: handle multiple order by keys 
                 return Ok(());
             }
 
@@ -577,11 +576,11 @@ fn push_predicate(
 fn push_scan_direction(operator: &mut Operator, direction: &Direction) {
     match operator {
         Operator::Projection { source, .. } => push_scan_direction(source, direction),
-        Operator::Scan { reverse, .. } => {
-            if reverse.is_none() {
+        Operator::Scan { iter_dir, .. } => {
+            if iter_dir.is_none() {
                 match direction {
-                    Direction::Ascending => *reverse = Some(false),
-                    Direction::Descending => *reverse = Some(true),
+                    Direction::Ascending => *iter_dir= Some(IterationDirection::Forwards),
+                    Direction::Descending => *iter_dir = Some(IterationDirection::Backwards),
                 }
             }
         }
