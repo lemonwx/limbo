@@ -12,7 +12,7 @@ use crate::{
     Result,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResultSetColumn {
     pub expr: ast::Expr,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
@@ -101,6 +101,7 @@ impl SourceOperator {
                     table: table_ref.table_index,
                     column: idx,
                     is_rowid_alias: col.is_rowid_alias,
+                    index_name: None,
                 },
                 contains_aggregates: false,
             });
@@ -202,6 +203,17 @@ pub struct BTreeTableReference {
     pub table: Rc<BTreeTable>,
     pub table_identifier: String,
     pub table_index: usize,
+    // None indicates that it is unknown which columns will be read from the table.
+    pub cols_prepare_to_read: Option<Vec<Column>>,
+}
+
+impl BTreeTableReference {
+    pub fn push_col_to_read(&mut self, col: Column) {
+        match &mut self.cols_prepare_to_read {
+            Some(cols) => cols.push(col),
+            None => self.cols_prepare_to_read = Some(vec![col]),
+        }
+    }
 }
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
@@ -221,7 +233,18 @@ pub enum Search {
         index: Rc<Index>,
         cmp_op: ast::Operator,
         cmp_expr: ast::Expr,
+        covering: bool,
     },
+}
+
+impl Search {
+    pub fn is_covering_index_search(&self) -> bool {
+        if let Search::IndexSearch { covering, .. } = self {
+            *covering
+        } else {
+            false
+        }
+    }
 }
 
 impl SourceOperator {
@@ -434,7 +457,7 @@ pub fn get_table_ref_bitmask_for_ast_expr<'a>(
             table_refs_mask |= get_table_ref_bitmask_for_ast_expr(tables, e2)?;
         }
         ast::Expr::Column { table, .. } => {
-            table_refs_mask |= 1 << table;
+            table_refs_mask |= 1 << *table;
         }
         ast::Expr::Id(_) => unreachable!("Id should be resolved to a Column before optimizer"),
         ast::Expr::Qualified(_, _) => {

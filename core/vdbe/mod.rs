@@ -55,7 +55,6 @@ pub type BranchOffset = i64;
 pub type CursorID = usize;
 
 pub type PageIdx = usize;
-
 // Index of insn in list of insns
 type InsnReference = usize;
 
@@ -1359,6 +1358,16 @@ impl Program {
                 }
                 Insn::Blob { value, dest } => {
                     state.registers[*dest] = OwnedValue::Blob(Rc::new(value.clone()));
+                    state.pc += 1;
+                }
+
+                Insn::IdxRowId { cursor_id, dest } => {
+                    let cursor = cursors.get_mut(cursor_id).unwrap();
+                    if let Some(rowid) = cursor.rowid()? {
+                        state.registers[*dest] = OwnedValue::Integer(rowid as i64);
+                    } else {
+                        state.registers[*dest] = OwnedValue::Null;
+                    }
                     state.pc += 1;
                 }
                 Insn::RowId { cursor_id, dest } => {

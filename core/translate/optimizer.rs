@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use sqlite3_parser::ast;
+use sqlite3_parser::ast::{self, Expr};
 
 use crate::{schema::Index, Result};
 
@@ -41,6 +41,7 @@ fn optimize_select_plan(mut plan: SelectPlan) -> Result<SelectPlan> {
         &plan.referenced_tables,
         &plan.available_indexes,
     )?;
+    update_column_read_from(&mut plan);
 
     eliminate_unnecessary_orderby(
         &mut plan.source,
@@ -72,7 +73,7 @@ fn optimize_delete_plan(mut plan: DeletePlan) -> Result<DeletePlan> {
 
 fn _operator_is_already_ordered_by(
     operator: &mut SourceOperator,
-    key: &mut ast::Expr,
+    key: &mut Expr,
     referenced_tables: &[BTreeTableReference],
     available_indexes: &Vec<Rc<Index>>,
 ) -> Result<bool> {
@@ -94,7 +95,7 @@ fn _operator_is_already_ordered_by(
                     available_indexes,
                 )?;
                 let index_is_the_same = index_idx
-                    .map(|i| Rc::ptr_eq(&available_indexes[i], index))
+                    .map(|(i, _)| Rc::ptr_eq(&available_indexes[i], index))
                     .unwrap_or(false);
                 Ok(index_is_the_same)
             }
@@ -108,7 +109,7 @@ fn _operator_is_already_ordered_by(
 
 fn eliminate_unnecessary_orderby(
     operator: &mut SourceOperator,
-    order_by: &mut Option<Vec<(ast::Expr, Direction)>>,
+    order_by: &mut Option<Vec<(Expr, Direction)>>,
     referenced_tables: &[BTreeTableReference],
     available_indexes: &Vec<Rc<Index>>,
 ) -> Result<()> {
@@ -134,6 +135,57 @@ fn eliminate_unnecessary_orderby(
     }
 
     Ok(())
+}
+
+fn read_column_from_index(
+    expr: &mut Expr,
+    referenced_tables: &[BTreeTableReference],
+    index: &Rc<Index>,
+) {
+    match expr {
+        Expr::FunctionCall { args, .. } => {
+            if let Some(args) = args {
+                args.iter_mut().for_each(|arg| {
+                    read_column_from_index(arg, referenced_tables, index);
+                });
+            }
+        }
+        Expr::Column {
+            table,
+            column,
+            index_name,
+            ..
+        } => {
+            let tbl_ref = &referenced_tables[*table];
+            let col = &tbl_ref.table.columns[*column];
+            if !col.primary_key {
+                *column = index
+                    .columns
+                    .iter()
+                    .position(|col_def| col_def.name == col.name)
+                    .unwrap();
+            }
+            *index_name = Some(index.name.clone())
+        }
+        _ => {}
+    }
+}
+
+// update the result_columns's index_name and column_id if using index
+fn update_column_read_from(plan: &mut SelectPlan) {
+    if let SourceOperator::Search { search, .. } = &plan.source {
+        if let Search::IndexSearch {
+            index, covering, ..
+        } = search
+        {
+            if !*covering {
+                return;
+            }
+            plan.result_columns.iter_mut().for_each(|col| {
+                read_column_from_index(&mut col.expr, &plan.referenced_tables, index);
+            });
+        }
+    }
 }
 
 /**
@@ -333,7 +385,7 @@ fn eliminate_constants(
 */
 fn push_predicates(
     operator: &mut SourceOperator,
-    where_clause: &mut Option<Vec<ast::Expr>>,
+    where_clause: &mut Option<Vec<Expr>>,
     referenced_tables: &Vec<BTreeTableReference>,
 ) -> Result<()> {
     // First try to push down any predicates from the WHERE clause
@@ -423,9 +475,9 @@ fn push_predicates(
 */
 fn push_predicate(
     operator: &mut SourceOperator,
-    predicate: ast::Expr,
+    predicate: Expr,
     referenced_tables: &Vec<BTreeTableReference>,
-) -> Result<Option<ast::Expr>> {
+) -> Result<Option<Expr>> {
     match operator {
         SourceOperator::Scan {
             predicates,
@@ -597,13 +649,13 @@ pub trait Optimizable {
         table_index: usize,
         referenced_tables: &[BTreeTableReference],
         available_indexes: &[Rc<Index>],
-    ) -> Result<Option<usize>>;
+    ) -> Result<Option<(usize, usize)>>;
 }
 
-impl Optimizable for ast::Expr {
+impl Optimizable for Expr {
     fn is_rowid_alias_of(&self, table_index: usize) -> bool {
         match self {
-            Self::Column {
+            Expr::Column {
                 table,
                 is_rowid_alias,
                 ..
@@ -611,32 +663,35 @@ impl Optimizable for ast::Expr {
             _ => false,
         }
     }
+
+    /*
+     * @return Result
+     * - Ok(Some((index_at, table_at))) indicates that a suitable index for scanning has been found.
+     *   - index_at is the index within the `available_indexes` where the suitable index was found.
+     *   - index_at is the index of the table within `referenced_tables` to which the found index belongs.
+     * - Ok(None) indicates that no suitable index for scanning was found.
+     * - Err(e) indicates that an error occurred during the check process.
+     */
     fn check_index_scan(
         &mut self,
         table_index: usize,
         referenced_tables: &[BTreeTableReference],
         available_indexes: &[Rc<Index>],
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<(usize, usize)>> {
         match self {
-            Self::Column { table, column, .. } => {
-                if *table != table_index {
-                    return Ok(None);
-                }
+            Expr::Column { table, column, .. } => {
                 for (idx, index) in available_indexes.iter().enumerate() {
-                    if index.table_name == referenced_tables[*table].table.name {
-                        let column = referenced_tables[*table]
-                            .table
-                            .columns
-                            .get(*column)
-                            .unwrap();
+                    let referenced_table = &referenced_tables[*table];
+                    if index.table_name == referenced_table.table.name {
+                        let column = referenced_table.table.columns.get(*column).unwrap();
                         if index.columns.first().unwrap().name == column.name {
-                            return Ok(Some(idx));
+                            return Ok(Some((idx, *table)));
                         }
                     }
                 }
                 Ok(None)
             }
-            Self::Binary(lhs, op, rhs) => {
+            Expr::Binary(lhs, op, rhs) => {
                 let lhs_index =
                     lhs.check_index_scan(table_index, referenced_tables, available_indexes)?;
                 if lhs_index.is_some() {
@@ -648,7 +703,7 @@ impl Optimizable for ast::Expr {
                     // swap lhs and rhs
                     let lhs_new = rhs.take_ownership();
                     let rhs_new = lhs.take_ownership();
-                    *self = Self::Binary(Box::new(lhs_new), *op, Box::new(rhs_new));
+                    *self = Expr::Binary(Box::new(lhs_new), *op, Box::new(rhs_new));
                     return Ok(rhs_index);
                 }
                 Ok(None)
@@ -656,19 +711,10 @@ impl Optimizable for ast::Expr {
             _ => Ok(None),
         }
     }
+
     fn check_constant(&self) -> Result<Option<ConstantPredicate>> {
         match self {
-            Self::Id(id) => {
-                // true and false are special constants that are effectively aliases for 1 and 0
-                if id.0.eq_ignore_ascii_case("true") {
-                    return Ok(Some(ConstantPredicate::AlwaysTrue));
-                }
-                if id.0.eq_ignore_ascii_case("false") {
-                    return Ok(Some(ConstantPredicate::AlwaysFalse));
-                }
-                return Ok(None);
-            }
-            Self::Literal(lit) => match lit {
+            Expr::Literal(lit) => match lit {
                 ast::Literal::Null => Ok(Some(ConstantPredicate::AlwaysFalse)),
                 ast::Literal::Numeric(b) => {
                     if let Ok(int_value) = b.parse::<i64>() {
@@ -710,7 +756,7 @@ impl Optimizable for ast::Expr {
                 }
                 _ => Ok(None),
             },
-            Self::Unary(op, expr) => {
+            Expr::Unary(op, expr) => {
                 if *op == ast::UnaryOperator::Not {
                     let trivial = expr.check_constant()?;
                     return Ok(trivial.map(|t| match t {
@@ -726,7 +772,7 @@ impl Optimizable for ast::Expr {
 
                 Ok(None)
             }
-            Self::InList { lhs: _, not, rhs } => {
+            Expr::InList { lhs: _, not, rhs } => {
                 if rhs.is_none() {
                     return Ok(Some(if *not {
                         ConstantPredicate::AlwaysTrue
@@ -745,7 +791,7 @@ impl Optimizable for ast::Expr {
 
                 Ok(None)
             }
-            Self::Binary(lhs, op, rhs) => {
+            Expr::Binary(lhs, op, rhs) => {
                 let lhs_trivial = lhs.check_constant()?;
                 let rhs_trivial = rhs.check_constant()?;
                 match op {
@@ -791,13 +837,13 @@ pub enum Either<T, U> {
 }
 
 pub fn try_extract_index_search_expression(
-    expr: ast::Expr,
+    expr: Expr,
     table_index: usize,
     referenced_tables: &[BTreeTableReference],
     available_indexes: &[Rc<Index>],
-) -> Result<Either<ast::Expr, Search>> {
+) -> Result<Either<Expr, Search>> {
     match expr {
-        ast::Expr::Binary(mut lhs, operator, mut rhs) => {
+        Expr::Binary(mut lhs, operator, mut rhs) => {
             if lhs.is_rowid_alias_of(table_index) {
                 match operator {
                     ast::Operator::Equals => {
@@ -834,7 +880,7 @@ pub fn try_extract_index_search_expression(
                 }
             }
 
-            if let Some(index_index) =
+            if let Some((index_index, table_index)) =
                 lhs.check_index_scan(table_index, referenced_tables, available_indexes)?
             {
                 match operator {
@@ -843,17 +889,28 @@ pub fn try_extract_index_search_expression(
                     | ast::Operator::GreaterEquals
                     | ast::Operator::Less
                     | ast::Operator::LessEquals => {
+                        let index = &available_indexes[index_index];
+                        let table = &referenced_tables[table_index];
+
+                        let covering = match &table.cols_prepare_to_read {
+                            Some(cols) => cols.iter().all(|col| {
+                                col.primary_key
+                                    || index.columns.iter().any(|idx_col| idx_col.name == col.name)
+                            }),
+                            None => false,
+                        };
                         return Ok(Either::Right(Search::IndexSearch {
                             index: available_indexes[index_index].clone(),
                             cmp_op: operator,
                             cmp_expr: *rhs,
+                            covering,
                         }));
                     }
                     _ => {}
                 }
             }
 
-            if let Some(index_index) =
+            if let Some((index_index, table_index)) =
                 rhs.check_index_scan(table_index, referenced_tables, available_indexes)?
             {
                 match operator {
@@ -862,17 +919,27 @@ pub fn try_extract_index_search_expression(
                     | ast::Operator::GreaterEquals
                     | ast::Operator::Less
                     | ast::Operator::LessEquals => {
+                        let index = &available_indexes[index_index];
+                        let table = &referenced_tables[table_index];
+                        let covering = match &table.cols_prepare_to_read {
+                            Some(cols) => cols.iter().all(|col| {
+                                col.primary_key
+                                    || index.columns.iter().any(|idx_col| idx_col.name == col.name)
+                            }),
+                            None => false,
+                        };
                         return Ok(Either::Right(Search::IndexSearch {
                             index: available_indexes[index_index].clone(),
                             cmp_op: operator,
                             cmp_expr: *lhs,
+                            covering,
                         }));
                     }
                     _ => {}
                 }
             }
 
-            Ok(Either::Left(ast::Expr::Binary(lhs, operator, rhs)))
+            Ok(Either::Left(Expr::Binary(lhs, operator, rhs)))
         }
         _ => Ok(Either::Left(expr)),
     }
@@ -941,9 +1008,9 @@ trait TakeOwnership {
     fn take_ownership(&mut self) -> Self;
 }
 
-impl TakeOwnership for ast::Expr {
+impl TakeOwnership for Expr {
     fn take_ownership(&mut self) -> Self {
-        std::mem::replace(self, ast::Expr::Literal(ast::Literal::Null))
+        std::mem::replace(self, Expr::Literal(ast::Literal::Null))
     }
 }
 

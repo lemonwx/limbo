@@ -93,7 +93,7 @@ fn resolve_aggregates(expr: &ast::Expr, aggs: &mut Vec<Aggregate>) -> bool {
 /// Id, Qualified and DoublyQualified are converted to Column.
 fn bind_column_references(
     expr: &mut ast::Expr,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &mut [BTreeTableReference],
 ) -> Result<()> {
     match expr {
         ast::Expr::Id(id) => {
@@ -104,7 +104,7 @@ fn bind_column_references(
             }
             let mut match_result = None;
             let normalized_id = normalize_ident(id.0.as_str());
-            for (tbl_idx, table) in referenced_tables.iter().enumerate() {
+            for (tbl_idx, table) in referenced_tables.iter_mut().enumerate() {
                 let col_idx = table
                     .table
                     .columns
@@ -116,6 +116,7 @@ fn bind_column_references(
                     }
                     let col = table.table.columns.get(col_idx.unwrap()).unwrap();
                     match_result = Some((tbl_idx, col_idx.unwrap(), col.primary_key));
+                    table.push_col_to_read(col.clone());
                 }
             }
             if match_result.is_none() {
@@ -127,6 +128,7 @@ fn bind_column_references(
                 table: tbl_idx,
                 column: col_idx,
                 is_rowid_alias: is_primary_key,
+                index_name: None,
             };
             Ok(())
         }
@@ -154,12 +156,17 @@ fn bind_column_references(
                 .columns
                 .get(col_idx.unwrap())
                 .unwrap();
+
             *expr = ast::Expr::Column {
                 database: None, // TODO: support different databases
                 table: tbl_idx,
                 column: col_idx.unwrap(),
                 is_rowid_alias: col.is_rowid_alias,
+                index_name: None,
             };
+
+            referenced_tables[tbl_idx].push_col_to_read(col.clone());
+
             Ok(())
         }
         ast::Expr::Between {
@@ -292,39 +299,57 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
             };
 
             // Parse the WHERE clause
-            plan.where_clause = parse_where(where_clause, &plan.referenced_tables)?;
+            plan.where_clause = parse_where(where_clause, &mut plan.referenced_tables)?;
 
             let mut aggregate_expressions = Vec::new();
             for column in columns.clone() {
                 match column {
                     ast::ResultColumn::Star => {
-                        plan.source.select_star(&mut plan.result_columns);
+                        for table_reference in plan.referenced_tables.iter_mut() {
+                            for idx in 0..table_reference.table.columns.len() {
+                                let col = &table_reference.table.columns[idx];
+                                plan.result_columns.push(ResultSetColumn {
+                                    expr: ast::Expr::Column {
+                                        database: None, // TODO: support different databases
+                                        table: table_reference.table_index,
+                                        column: idx,
+                                        is_rowid_alias: col.primary_key,
+                                        index_name: None,
+                                    },
+                                    contains_aggregates: false,
+                                });
+                                table_reference.push_col_to_read(col.clone());
+                            }
+                        }
                     }
                     ast::ResultColumn::TableStar(name) => {
                         let name_normalized = normalize_ident(name.0.as_str());
                         let referenced_table = plan
                             .referenced_tables
-                            .iter()
+                            .iter_mut()
                             .find(|t| t.table_identifier == name_normalized);
 
                         if referenced_table.is_none() {
                             crate::bail_parse_error!("Table {} not found", name.0);
                         }
                         let table_reference = referenced_table.unwrap();
-                        for (idx, col) in table_reference.table.columns.iter().enumerate() {
+                        for idx in 0..table_reference.table.columns.len() {
+                            let col = &table_reference.table.columns[idx];
                             plan.result_columns.push(ResultSetColumn {
                                 expr: ast::Expr::Column {
                                     database: None, // TODO: support different databases
                                     table: table_reference.table_index,
                                     column: idx,
                                     is_rowid_alias: col.is_rowid_alias,
+                                    index_name: None,
                                 },
                                 contains_aggregates: false,
                             });
+                            table_reference.push_col_to_read(col.clone());
                         }
                     }
                     ast::ResultColumn::Expr(mut expr, _) => {
-                        bind_column_references(&mut expr, &plan.referenced_tables)?;
+                        bind_column_references(&mut expr, &mut plan.referenced_tables)?;
                         match &expr {
                             ast::Expr::FunctionCall {
                                 name,
@@ -406,7 +431,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
             }
             if let Some(mut group_by) = group_by {
                 for expr in group_by.exprs.iter_mut() {
-                    bind_column_references(expr, &plan.referenced_tables)?;
+                    bind_column_references(expr, &mut plan.referenced_tables)?;
                 }
 
                 plan.group_by = Some(GroupBy {
@@ -415,7 +440,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                         let mut predicates = vec![];
                         break_predicate_at_and_boundaries(having, &mut predicates);
                         for expr in predicates.iter_mut() {
-                            bind_column_references(expr, &plan.referenced_tables)?;
+                            bind_column_references(expr, &mut plan.referenced_tables)?;
                             let contains_aggregates =
                                 resolve_aggregates(expr, &mut aggregate_expressions);
                             if !contains_aggregates {
@@ -461,7 +486,7 @@ pub fn prepare_select_plan<'a>(schema: &Schema, select: ast::Select) -> Result<P
                         o.expr
                     };
 
-                    bind_column_references(&mut expr, &plan.referenced_tables)?;
+                    bind_column_references(&mut expr, &mut plan.referenced_tables)?;
                     resolve_aggregates(&expr, &mut plan.aggregates);
 
                     key.push((
@@ -500,11 +525,12 @@ pub fn prepare_delete_plan(
         table: table.clone(),
         table_identifier: table.name.clone(),
         table_index: 0,
+        cols_prepare_to_read: None,
     };
     let referenced_tables = vec![table_ref.clone()];
 
     // Parse the WHERE clause
-    let resolved_where_clauses = parse_where(where_clause, &[table_ref.clone()])?;
+    let resolved_where_clauses = parse_where(where_clause, &mut [table_ref.clone()])?;
 
     // Parse the LIMIT clause
     let resolved_limit = limit.and_then(|limit| parse_limit(limit));
@@ -557,6 +583,7 @@ fn parse_from(
                 table: table.clone(),
                 table_identifier: alias.unwrap_or(normalized_qualified_name),
                 table_index: 0,
+                cols_prepare_to_read: None,
             }
         }
         _ => todo!(),
@@ -591,7 +618,7 @@ fn parse_from(
 
 fn parse_where(
     where_clause: Option<Expr>,
-    referenced_tables: &[BTreeTableReference],
+    referenced_tables: &mut [BTreeTableReference],
 ) -> Result<Option<Vec<Expr>>> {
     if let Some(where_expr) = where_clause {
         let mut predicates = vec![];
@@ -639,6 +666,7 @@ fn parse_join(
                 table: table.clone(),
                 table_identifier: alias.unwrap_or(normalized_name),
                 table_index,
+                cols_prepare_to_read: None,
             }
         }
         _ => todo!(),
@@ -759,6 +787,7 @@ fn parse_join(
                             table: left_table_idx,
                             column: left_col_idx,
                             is_rowid_alias: left_col.is_rowid_alias,
+                            index_name: None,
                         }),
                         ast::Operator::Equals,
                         Box::new(ast::Expr::Column {
@@ -766,6 +795,7 @@ fn parse_join(
                             table: right_table.table_index,
                             column: right_col_idx,
                             is_rowid_alias: right_col.is_rowid_alias,
+                            index_name: None,
                         }),
                     ));
                 }

@@ -281,6 +281,11 @@ pub enum Insn {
         dest: usize,
     },
 
+    IdxRowId {
+        cursor_id: CursorID,
+        dest: usize,
+    },
+
     // Seek to a rowid in the cursor. If not found, jump to the given PC. Otherwise, continue to the next instruction.
     SeekRowid {
         cursor_id: CursorID,

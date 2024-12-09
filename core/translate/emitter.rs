@@ -543,11 +543,13 @@ fn init_source(
 
             match mode {
                 OperationMode::SELECT => {
-                    program.emit_insn(Insn::OpenReadAsync {
-                        cursor_id: table_cursor_id,
-                        root_page: table_reference.table.root_page,
-                    });
-                    program.emit_insn(Insn::OpenReadAwait {});
+                    if !search.is_covering_index_search() {
+                        program.emit_insn(Insn::OpenReadAsync {
+                            cursor_id: table_cursor_id,
+                            root_page: table_reference.table.root_page,
+                        });
+                        program.emit_insn(Insn::OpenReadAwait {});
+                    }
                 }
                 OperationMode::DELETE => {
                     program.emit_insn(Insn::OpenWriteAsync {
@@ -735,7 +737,12 @@ fn open_loop(
             // Open the loop for the index search.
             // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
             if !matches!(search, Search::RowidEq { .. }) {
-                let index_cursor_id = if let Search::IndexSearch { index, .. } = search {
+                let mut covering_index = false;
+                let index_cursor_id = if let Search::IndexSearch {
+                    index, covering, ..
+                } = search
+                {
+                    covering_index = *covering;
                     Some(program.resolve_cursor_id(&index.name))
                 } else {
                     None
@@ -865,10 +872,12 @@ fn open_loop(
                 }
 
                 if let Some(index_cursor_id) = index_cursor_id {
-                    program.emit_insn(Insn::DeferredSeek {
-                        index_cursor_id,
-                        table_cursor_id,
-                    });
+                    if !covering_index {
+                        program.emit_insn(Insn::DeferredSeek {
+                            index_cursor_id,
+                            table_cursor_id,
+                        });
+                    }
                 }
             }
 
