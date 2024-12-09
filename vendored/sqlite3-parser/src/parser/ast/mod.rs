@@ -337,6 +337,9 @@ pub enum Expr {
         column: usize,
         /// is the column a rowid alias
         is_rowid_alias: bool,
+        /// Some(xx): means the Column is read from SecondryIndex
+        /// None: means the Column is read from PrimaryIndex
+        index_name: Option<String>,
     },
     /// `IN`
     InList {
